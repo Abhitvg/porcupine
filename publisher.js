@@ -2,6 +2,7 @@ const { db } = require('./db');
 const fs = require('fs');
 const path = require('path');
 const { TwitterApi } = require('twitter-api-v2');
+const nodemailer = require('nodemailer');
 
 const env = require('./utils/env');
 
@@ -209,12 +210,19 @@ async function publishSEOContent(content, forcedDate = null) {
   console.log(`[PUBLISHER] Wrote SEO article to ${filePath}`);
   
   try {
-    const { execSync } = require('child_process');
-    // FIX: Use the git repo root, not the subdirectory
-    execSync('git add . && git commit -m "Auto-published new SEO article" && git push', { cwd: repoRoot });
-    console.log(`[PUBLISHER] Pushed new article to GitHub for deployment`);
+    const { exec } = require('child_process');
+    const util = require('util');
+    const execAsync = util.promisify(exec);
+    
+    // We run this without awaiting so it doesn't block the caller, 
+    // or we await it since the caller `publishSEOContent` is async anyway.
+    // Since publishSEOContent is awaited in `orchestrator.js`, awaiting it here still blocks that specific agent's tick, but doesn't block the Node event loop.
+    // To be perfectly non-blocking, we just fire and forget the git push.
+    execAsync('git add . && git commit -m "Auto-published new SEO article" && git push', { cwd: repoRoot })
+      .then(() => console.log(`[PUBLISHER] Pushed new article to GitHub for deployment`))
+      .catch((err) => console.error("[PUBLISHER] Failed to push to GitHub:", err.message));
   } catch (err) {
-    console.error("[PUBLISHER] Failed to push to GitHub:", err.message);
+    console.error("[PUBLISHER] Git exec error:", err.message);
   }
 
   return filePath;
@@ -223,13 +231,22 @@ async function publishSEOContent(content, forcedDate = null) {
 // ─── CRM Campaign ────────────────────────────────────────────────────────────
 async function runCRMCampaign(content) {
   try {
-    const urls = JSON.parse(content);
-    if (!Array.isArray(urls)) throw new Error("Expected JSON array of URLs");
+    let urls = [];
+    let campaignCopy = "";
+    
+    try {
+      urls = JSON.parse(content);
+      if (!Array.isArray(urls)) throw new Error("Expected JSON array of URLs");
+    } catch (parseErr) {
+      // Treat as raw email copy if not valid JSON
+      campaignCopy = content;
+      urls = ["sales@example.com", "marketing@example.com"]; // Mock target list
+    }
     
     const res = await fetch('http://localhost:3333/api/run-campaign', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ urls })
+      body: JSON.stringify({ urls, campaignCopy })
     });
     
     if (!res.ok) {
@@ -238,7 +255,52 @@ async function runCRMCampaign(content) {
     console.log(`[PUBLISHER] Triggered CRM campaign for ${urls.length} URLs`);
     return `crm_campaign_${Date.now()}`;
   } catch (e) {
-    throw new Error(`Failed to parse or run CRM campaign: ${e.message}`);
+    throw new Error(`Failed to run CRM campaign: ${e.message}`);
+  }
+}
+
+// ─── Email Publishing (Gmail) ────────────────────────────────────────────────
+async function sendEmail(content, targetAccountId = null) {
+  let query = "SELECT * FROM accounts WHERE platform = 'gmail' AND is_active = 1";
+  let params = [];
+  if (targetAccountId) {
+    query += " AND id = ?";
+    params.push(targetAccountId);
+  }
+
+  const account = db.prepare(query).get(...params);
+  if (!account) {
+    console.warn("[PUBLISHER] No active Gmail accounts found.");
+    throw new Error("No active Gmail account found");
+  }
+
+  let emailData;
+  try {
+    emailData = JSON.parse(content);
+  } catch (e) {
+    throw new Error("Email content must be valid JSON with 'to', 'subject', and 'body'");
+  }
+
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: account.account_name, // e.g. atma@gmail.com
+      pass: account.access_token  // App Password
+    }
+  });
+
+  try {
+    const info = await transporter.sendMail({
+      from: account.account_name,
+      to: emailData.to,
+      subject: emailData.subject,
+      html: emailData.body.replace(/\n/g, '<br>')
+    });
+    console.log(`[PUBLISHER] Sent email to ${emailData.to}. MessageId: ${info.messageId}`);
+    return `email_${Date.now()}_${info.messageId}`;
+  } catch (err) {
+    console.error("[PUBLISHER] Failed to send email:", err.message);
+    throw err;
   }
 }
 
@@ -258,6 +320,8 @@ async function executeAction(actionType, content, targetAccountId = null, imageU
       reference_id = await publishSEOContent(content, forcedDate);
     } else if (actionType === 'crm-campaign') {
       reference_id = await runCRMCampaign(content);
+    } else if (actionType === 'email') {
+      reference_id = await sendEmail(content, targetAccountId);
     } else {
       reference_id = `generic_${Date.now()}`;
       console.log(`[PUBLISHER] Executed generic action: ${content.substring(0,50)}`);

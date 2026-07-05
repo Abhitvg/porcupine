@@ -28,11 +28,33 @@ contextBridge.exposeInMainWorld('electron', {
       'start-linkedin-oauth',
       'get-settings',
       'save-settings',
-      'test-webhook'
+      'test-webhook',
+      'get-organizations',
+      'create-organization',
+      'get-leads',
+      'add-lead',
+      'get-orders',
+      'add-order',
+      'get-billing',
+      'get-support-tickets',
+      'add-support-ticket',
+      'get-domain-experts',
+      'add-domain-expert',
+      'twitter-oauth-login',
+      'get-investors',
+      'add-investor',
+      'upload-investors-csv',
+      'trigger-investor-outreach'
     ];
     if (validChannels.includes(channel)) {
       return ipcRenderer.invoke(channel, data);
     }
     return Promise.reject(new Error(`Unauthorized IPC channel: ${channel}`));
+  },
+  onStateUpdate: (callback) => {
+    ipcRenderer.on('db-changed', () => callback());
+  },
+  offStateUpdate: () => {
+    ipcRenderer.removeAllListeners('db-changed');
   }
 });

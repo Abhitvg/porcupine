@@ -1,0 +1,41 @@
+ATMA AI is a premier AI consultancy firm that helps businesses automate their workflows and operations.
+The company was founded in 2024 with a mission to bring autonomous AI agents to enterprise software.
+
+Our core offering is the Porcupine Orchestrator, an advanced multi-agent system that autonomously routes tasks across different specialized agents. The agents communicate with each other through a centralized SQLite database.
+
+Brand Tone & Voice Guidelines:
+We speak with authority, but we remain approachable.
+We use words like "Autonomous", "Scalable", "Robust", and "Secure".
+We never use generic terms like "Delve", "Moreover", or "Tapestry". We aim for extreme humanization.
+
+Target Audience:
+Our ideal customers are CTOs, VPs of Engineering, and Directors of Innovation at mid-sized to large enterprises. They are looking to reduce operational overhead by 40% through AI automation.
+
+Case Study - Enterprise Client:
+ATMA AI helped a leading enterprise e-commerce brand reduce their customer service ticket resolution time by 75% using a custom LLM pipeline and the Porcupine Orchestrator. We integrated directly into their Zendesk instance.
+
+
+### Company Profile (ATMA Consultancy Services / ATMA-AI)
+ATMA-AI is an elite AI and IT consultancy founded by distinguished alumni from IIT Delhi and Jawaharlal Nehru University (JNU). The company specializes in delivering highly secure, high-performance enterprise AI solutions with a focus on custom LLM deployment, enterprise architecture, neuro-symbolic AI research, and edge robotics. We apply deep academic rigor and precision engineering, tailoring machine learning pipelines directly to enterprise data rather than relying solely on public APIs.
+
+### Leadership Team
+- **Abhishek Singh**: Co-Founder & CEO (Alumni of JNU)
+- **Avadhesh Kumar**: Co-Founder & CTO (Alumni of IIT Delhi)
+- **Chirag Beniwal**: Co-Founder & CMO (Alumni of JNU)
+- **Kumar Pratyay**: Co-Founder & CFO (Alumni of JNU)
+
+### Core Services
+1. **AI & GenAI Solutions**: Custom LLM deployment, RAG pipelines, and autonomous digital labor.
+2. **Data Science & Analytics**: Predictive models and real-time dashboards for strategic foresight.
+3. **Enterprise Architecture**: Scalable, high-performance systems designed for zero downtime.
+4. **Cloud Infrastructure**: Cloud-native migrations and DevOps pipelines.
+5. **Full-Stack Development**: Modern web and mobile applications (Next.js, React, Node).
+6. **Cybersecurity Consulting**: Zero-trust architectures, penetration testing, and compliance-first security.
+
+### Core Philosophy & Research Focus
+- **Zero Trust AI**: Ensuring enterprise data is never leaked to public models via single-tenant infrastructure and strict RBAC.
+- **Neural Pipelines**: Structuring siloed enterprise data using RAG to overcome data debt.
+- **Composable AI Architectures**: Restructuring AI workloads into event-driven micro-services to ensure version control, data privacy, and cost predictability.
+- **Lean LLM Orchestration**: Favoring targeted routing over massive over-engineered AI systems. Routing tasks based on latency, cost, and compliance needs across models like Claude 3.5, Gemini 2.5, and Llama 3.1.
+- **Digital Labor**: Deploying Enterprise Autonomous AI Agents that execute complex workflows with zero human intervention.
+- **Global AI Engineering**: Establishing India as the center for enterprise AI engineering and innovation.

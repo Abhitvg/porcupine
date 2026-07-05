@@ -1,5 +1,8 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, safeStorage } = require('electron');
 const path = require('path');
+const crypto = require('crypto');
+const https = require('https');
+const qs = require('querystring');
 const { initDb, db } = require('./db');
 const { startOrchestrator, executeManualTask } = require('./orchestrator');
 const { startVoiceListener } = require('./voice');
@@ -19,6 +22,10 @@ function createWindow() {
     }
   });
 
+  win.webContents.on('console-message', (event, level, message, line, sourceId) => {
+    console.log(`[Renderer] [${level}] ${message} (${sourceId}:${line})`);
+  });
+
   if (isDev) {
     win.loadURL('http://localhost:3333');
     win.webContents.openDevTools();
@@ -31,6 +38,26 @@ function createWindow() {
 
 app.whenReady().then(() => {
   initDb();
+  
+  // Migrate sensitive settings to safeStorage if available
+  if (safeStorage.isEncryptionAvailable()) {
+    const SENSITIVE_KEYS = ['openrouter_api_key'];
+    const rows = db.prepare('SELECT key, value FROM settings WHERE key IN (' + SENSITIVE_KEYS.map(k => `'${k}'`).join(',') + ')').all();
+    for (const row of rows) {
+      let isEncrypted = false;
+      try {
+        safeStorage.decryptString(Buffer.from(row.value, 'base64'));
+        isEncrypted = true;
+      } catch(e) {}
+      
+      if (!isEncrypted && row.value) {
+        console.log(`[Security] Migrating ${row.key} to safeStorage...`);
+        const encrypted = safeStorage.encryptString(row.value).toString('base64');
+        db.prepare('UPDATE settings SET value = ? WHERE key = ?').run(encrypted, row.key);
+      }
+    }
+  }
+
   startOrchestrator();
   const mainWindow = createWindow();
   startVoiceListener(ipcMain, mainWindow);
@@ -80,6 +107,7 @@ ipcMain.handle('save-vault-context', (event, content) => {
     // Let's call a reload function if we export it from orchestrator.
     const { loadRAGVault } = require('./orchestrator');
     if (loadRAGVault) loadRAGVault();
+    broadcastStateUpdate();
     return { success: true };
   } catch (e) {
     console.error('Error saving vault:', e);
@@ -87,33 +115,37 @@ ipcMain.handle('save-vault-context', (event, content) => {
   }
 });
 
-ipcMain.handle('submit-manual-task', async (event, { agentId, task }) => {
+ipcMain.handle('submit-manual-task', async (event, { agentId, task, orgId = 'org-default' }) => {
   executeManualTask(agentId, task);
-  return { success: true };
+  broadcastStateUpdate();
+    return { success: true };
 });
 
-ipcMain.handle('get-agents', () => {
-  return db.prepare('SELECT * FROM agents').all();
+ipcMain.handle('get-agents', (event, orgId = 'org-default') => {
+  return db.prepare('SELECT * FROM agents WHERE org_id = ?').all(orgId);
 });
 
 ipcMain.handle('toggle-auto-execute', (event, { agentId, autoExecute }) => {
   db.prepare('UPDATE agents SET auto_execute = ? WHERE id = ?').run(autoExecute ? 1 : 0, agentId);
-  return { success: true };
+  broadcastStateUpdate();
+    return { success: true };
 });
 
 ipcMain.handle('update-agent-model', (event, { agentId, model }) => {
   db.prepare('UPDATE agents SET model = ? WHERE id = ?').run(model, agentId);
-  return { success: true };
+  broadcastStateUpdate();
+    return { success: true };
 });
 
-ipcMain.handle('get-proposals', () => {
-  return db.prepare("SELECT * FROM proposals WHERE status = 'pending_review' ORDER BY created_at DESC").all();
+ipcMain.handle('get-proposals', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM proposals WHERE status = 'pending_review' AND org_id = ? ORDER BY created_at DESC").all(orgId);
 });
 
 ipcMain.handle('update-proposal-status', async (event, { proposalId, status, scheduledFor }) => {
   if (scheduledFor) {
     db.prepare('UPDATE proposals SET status = ?, scheduled_for = ? WHERE id = ?').run('scheduled', scheduledFor, proposalId);
     db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run('SYSTEM', `Proposal ${proposalId} scheduled for ${new Date(scheduledFor).toLocaleString()}.`);
+    broadcastStateUpdate();
     return { success: true };
   } else {
     db.prepare('UPDATE proposals SET status = ? WHERE id = ?').run(status, proposalId);
@@ -181,22 +213,23 @@ ipcMain.handle('update-proposal-status', async (event, { proposalId, status, sch
   return { success: true };
 });
 
-ipcMain.handle('get-analytics', () => {
-  return db.prepare('SELECT * FROM analytics').all();
+ipcMain.handle('get-analytics', (event, orgId = 'org-default') => {
+  return db.prepare('SELECT * FROM analytics WHERE org_id = ?').all(orgId);
 });
 
-ipcMain.handle('get-logs', () => {
-  return db.prepare('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 50').all();
+ipcMain.handle('get-logs', (event, orgId = 'org-default') => {
+  return db.prepare('SELECT * FROM logs WHERE org_id = ? ORDER BY timestamp DESC LIMIT 50').all(orgId);
 });
 
-ipcMain.handle('get-published-items', () => {
-  return db.prepare("SELECT * FROM published_items ORDER BY published_at DESC LIMIT 50").all();
+ipcMain.handle('get-published-items', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM published_items WHERE org_id = ? ORDER BY published_at DESC LIMIT 50").all(orgId);
 });
 
 ipcMain.handle('revoke-action', async (event, { id, platform, reference_id }) => {
   try {
     await revokeAction(platform, reference_id);
     db.prepare("UPDATE published_items SET status = 'revoked' WHERE id = ?").run(id);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     console.error("Revoke error:", err);
@@ -204,20 +237,144 @@ ipcMain.handle('revoke-action', async (event, { id, platform, reference_id }) =>
   }
 });
 
-// ─── Accounts IPC ─────────────────────────────────────────────────────────────
+ipcMain.handle('twitter-oauth-login', async (event) => {
+  const clientId = env.get('TWITTER_CLIENT_ID');
+  
+  if (!clientId || clientId === 'INSERT_YOUR_NEW_CLIENT_ID_HERE') {
+    return { success: false, error: 'Twitter Client ID not configured in .env' };
+  }
 
-ipcMain.handle('get-accounts', () => {
-  // FIX: Don't expose access_token to the renderer process
-  return db.prepare('SELECT id, platform, account_name, is_active, created_at FROM accounts').all();
+  // Generate PKCE code verifier and challenge
+  const codeVerifier = crypto.randomBytes(32).toString('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  const state = crypto.randomBytes(16).toString('hex');
+  const redirectUri = 'https://www.atma-ai.co.in/callback'; // Make sure this matches Developer Portal
+
+  const authUrl = `https://twitter.com/i/oauth2/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=tweet.read%20tweet.write%20users.read%20offline.access&state=${state}&code_challenge=${codeChallenge}&code_challenge_method=S256`;
+
+  return new Promise((resolve, reject) => {
+    let authWindow = new BrowserWindow({
+      width: 600,
+      height: 800,
+      show: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true
+      }
+    });
+
+    authWindow.loadURL(authUrl);
+    authWindow.show();
+
+    const filter = { urls: [`${redirectUri}*`] };
+    authWindow.webContents.session.webRequest.onBeforeRequest(filter, async (details, callback) => {
+      const url = new URL(details.url);
+      const code = url.searchParams.get('code');
+      const returnedState = url.searchParams.get('state');
+      const error = url.searchParams.get('error');
+
+      if (error) {
+        callback({ cancel: true });
+        authWindow.close();
+        resolve({ success: false, error });
+        return;
+      }
+
+      if (code && returnedState === state) {
+        callback({ cancel: true });
+        authWindow.close();
+        
+        try {
+          // Exchange code for token
+          const postData = qs.stringify({
+            code,
+            grant_type: 'authorization_code',
+            client_id: clientId,
+            redirect_uri: redirectUri,
+            code_verifier: codeVerifier
+          });
+
+          const options = {
+            hostname: 'api.twitter.com',
+            port: 443,
+            path: '/2/oauth2/token',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Content-Length': Buffer.byteLength(postData)
+            }
+          };
+
+          const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+              try {
+                const response = JSON.parse(data);
+                if (response.access_token) {
+                  // Save to DB
+                  const orgId = 'org-default';
+                  const accountName = 'Twitter User'; // Ideally we would fetch the user profile here, but let's keep it simple
+                  const stmt = db.prepare(`
+                    INSERT INTO accounts (platform, account_name, access_token, refresh_token, org_id) 
+                    VALUES (?, ?, ?, ?, ?)
+                  `);
+                  
+                  // Encrypt tokens before saving
+                  const encryptedAccess = safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(response.access_token).toString('base64') : response.access_token;
+                  const encryptedRefresh = response.refresh_token && safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(response.refresh_token).toString('base64') : (response.refresh_token || '');
+
+                  stmt.run('twitter', accountName, encryptedAccess, encryptedRefresh, orgId);
+                  
+                  // Also update settings table to maintain backwards compatibility
+                  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('twitter_access_token', ?)").run(encryptedAccess);
+                  if (encryptedRefresh) {
+                    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('twitter_refresh_token', ?)").run(encryptedRefresh);
+                  }
+
+                  resolve({ success: true });
+                } else {
+                  resolve({ success: false, error: response.error_description || 'Failed to get access token' });
+                }
+              } catch (e) {
+                resolve({ success: false, error: e.message });
+              }
+            });
+          });
+
+          req.on('error', (e) => resolve({ success: false, error: e.message }));
+          req.write(postData);
+          req.end();
+
+        } catch (e) {
+          resolve({ success: false, error: e.message });
+        }
+      } else {
+        callback({ cancel: false });
+      }
+    });
+
+    authWindow.on('closed', () => {
+      resolve({ success: false, error: 'Authentication window was closed' });
+    });
+  });
 });
 
-ipcMain.handle('add-account', (event, { platform, account_name, access_token, refresh_token, author_urn }) => {
+// ─── Accounts IPC ─────────────────────────────────────────────────────────────
+
+ipcMain.handle('get-accounts', (event, orgId = 'org-default') => {
+  // FIX: Don't expose access_token to the renderer process
+  return db.prepare('SELECT id, platform, account_name, is_active, created_at FROM accounts WHERE org_id = ?').all(orgId);
+});
+
+ipcMain.handle('add-account', (event, { platform, account_name, access_token, refresh_token, author_urn, orgId = 'org-default' }) => {
   try {
     if (platform === 'webhook') {
       author_urn = 'urn:webhook';
     }
-    const stmt = db.prepare('INSERT INTO accounts (platform, account_name, access_token, refresh_token, author_urn) VALUES (?, ?, ?, ?, ?)');
-    stmt.run(platform, account_name, access_token, refresh_token || null, author_urn || null);
+    const stmt = db.prepare('INSERT INTO accounts (platform, account_name, access_token, refresh_token, author_urn, org_id) VALUES (?, ?, ?, ?, ?, ?)');
+    stmt.run(platform, account_name, access_token, refresh_token || null, author_urn || null, orgId);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
@@ -227,6 +384,7 @@ ipcMain.handle('add-account', (event, { platform, account_name, access_token, re
 ipcMain.handle('toggle-account', (event, { id, is_active }) => {
   try {
     db.prepare('UPDATE accounts SET is_active = ? WHERE id = ?').run(is_active ? 1 : 0, id);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
@@ -236,6 +394,7 @@ ipcMain.handle('toggle-account', (event, { id, is_active }) => {
 ipcMain.handle('delete-account', (event, id) => {
   try {
     db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
@@ -351,13 +510,32 @@ ipcMain.handle('start-linkedin-oauth', async (event) => {
 
 // ─── Todos IPC ────────────────────────────────────────────────────────────────
 
-ipcMain.handle('get-todos', () => {
-  return db.prepare('SELECT * FROM todos ORDER BY created_at DESC').all();
+ipcMain.handle('get-todos', (event, orgId = 'org-default') => {
+  return db.prepare('SELECT * FROM todos WHERE org_id = ? ORDER BY created_at DESC').all(orgId);
 });
 
-ipcMain.handle('add-todo', (event, { text }) => {
+ipcMain.handle('get-organizations', () => {
   try {
-    const result = db.prepare('INSERT INTO todos (text) VALUES (?)').run(text);
+    return db.prepare('SELECT * FROM organizations ORDER BY created_at ASC').all();
+  } catch (err) {
+    return [];
+  }
+});
+
+ipcMain.handle('create-organization', (event, { id, name }) => {
+  try {
+    db.prepare('INSERT INTO organizations (id, name) VALUES (?, ?)').run(id, name);
+    broadcastStateUpdate();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('add-todo', (event, { text, orgId = 'org-default' }) => {
+  try {
+    const result = db.prepare('INSERT INTO todos (text, org_id) VALUES (?, ?)').run(text, orgId);
+    broadcastStateUpdate();
     return { success: true, id: result.lastInsertRowid };
   } catch (err) {
     return { success: false, error: err.message };
@@ -367,6 +545,7 @@ ipcMain.handle('add-todo', (event, { text }) => {
 ipcMain.handle('toggle-todo', (event, { id, done }) => {
   try {
     db.prepare('UPDATE todos SET done = ? WHERE id = ?').run(done ? 1 : 0, id);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
@@ -376,6 +555,7 @@ ipcMain.handle('toggle-todo', (event, { id, done }) => {
 ipcMain.handle('delete-todo', (event, id) => {
   try {
     db.prepare('DELETE FROM todos WHERE id = ?').run(id);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
@@ -387,21 +567,104 @@ ipcMain.handle('delete-todo', (event, id) => {
 ipcMain.handle('get-settings', () => {
   const rows = db.prepare('SELECT key, value FROM settings').all();
   const settings = {};
+  const SENSITIVE_KEYS = ['openrouter_api_key'];
   for (const row of rows) {
-    settings[row.key] = row.value;
+    if (SENSITIVE_KEYS.includes(row.key) && safeStorage.isEncryptionAvailable() && row.value) {
+      try {
+        settings[row.key] = safeStorage.decryptString(Buffer.from(row.value, 'base64'));
+      } catch (e) {
+        settings[row.key] = row.value; // Fallback or corrupted
+      }
+    } else {
+      settings[row.key] = row.value;
+    }
   }
   return settings;
 });
 
 ipcMain.handle('save-settings', (event, settings) => {
   try {
+    const SENSITIVE_KEYS = ['openrouter_api_key'];
     const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
     const update = db.transaction((settingsObj) => {
       for (const [key, value] of Object.entries(settingsObj)) {
-        stmt.run(key, value);
+        let finalValue = value;
+        if (SENSITIVE_KEYS.includes(key) && safeStorage.isEncryptionAvailable() && value) {
+          finalValue = safeStorage.encryptString(value).toString('base64');
+        }
+        stmt.run(key, finalValue);
       }
     });
     update(settings);
+    broadcastStateUpdate();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// ─── CRM & Sales IPC ────────────────────────────────────────────────────────────
+
+ipcMain.handle('get-leads', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM leads WHERE org_id = ? ORDER BY created_at DESC").all(orgId);
+});
+
+ipcMain.handle('add-lead', (event, { id, name, email, source, value, orgId = 'org-default' }) => {
+  try {
+    db.prepare("INSERT INTO leads (id, name, email, source, value, org_id) VALUES (?, ?, ?, ?, ?, ?)").run(id, name, email, source, value, orgId);
+    broadcastStateUpdate();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('get-orders', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM orders WHERE org_id = ? ORDER BY created_at DESC").all(orgId);
+});
+
+ipcMain.handle('add-order', (event, { id, leadId, totalAmount, orgId = 'org-default' }) => {
+  try {
+    db.prepare("INSERT INTO orders (id, lead_id, total_amount, org_id) VALUES (?, ?, ?, ?)").run(id, leadId, totalAmount, orgId);
+    broadcastStateUpdate();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// ─── Billing IPC ──────────────────────────────────────────────────────────────
+
+ipcMain.handle('get-billing', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM billing WHERE org_id = ?").all(orgId);
+});
+
+// ─── Support IPC ──────────────────────────────────────────────────────────────
+
+ipcMain.handle('get-support-tickets', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM support_tickets WHERE org_id = ? ORDER BY created_at DESC").all(orgId);
+});
+
+ipcMain.handle('add-support-ticket', (event, { id, subject, customerEmail, message, aiResponse, status = 'open', orgId = 'org-default' }) => {
+  try {
+    db.prepare("INSERT INTO support_tickets (id, subject, customer_email, message, ai_response, status, org_id) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, subject, customerEmail, message, aiResponse, status, orgId);
+    broadcastStateUpdate();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// ─── Domain Experts IPC ────────────────────────────────────────────────────────
+
+ipcMain.handle('get-domain-experts', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM domain_experts WHERE org_id = ?").all(orgId);
+});
+
+ipcMain.handle('add-domain-expert', (event, { id, name, domain, instructions, orgId = 'org-default' }) => {
+  try {
+    db.prepare("INSERT INTO domain_experts (id, name, domain, instructions, org_id) VALUES (?, ?, ?, ?, ?)").run(id, name, domain, instructions, orgId);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
@@ -410,22 +673,84 @@ ipcMain.handle('save-settings', (event, settings) => {
 
 // ─── Agents IPC ───────────────────────────────────────────────────────────────
 
-ipcMain.handle('create-agent', async (event, { id, name, systemPrompt }) => {
+ipcMain.handle('create-agent', async (event, { id, name, systemPrompt, orgId = 'org-default' }) => {
   try {
     const fs = require('fs');
     const path = require('path');
     
     // Insert into SQLite
-    db.prepare("INSERT INTO agents (id, name, status, auto_execute, model) VALUES (?, ?, 'idle', 0, 'google/gemini-2.5-pro:free')").run(id, name);
+    db.prepare("INSERT INTO agents (id, name, status, auto_execute, model, org_id) VALUES (?, ?, 'idle', 0, 'google/gemini-2.5-pro:free', ?)").run(id, name, orgId);
     
     // Write system prompt to file
     const promptPath = path.join(__dirname, 'src', 'agents', `${id}.md`);
     await fs.promises.writeFile(promptPath, systemPrompt, 'utf8');
     
     db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run('SYSTEM', `New agent cloned: ${name} (${id})`);
+    broadcastStateUpdate();
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
   }
 });
 
+// ─── Investors IPC ─────────────────────────────────────────────────────────────
+
+ipcMain.handle('get-investors', (event, orgId = 'org-default') => {
+  return db.prepare("SELECT * FROM investors WHERE org_id = ? ORDER BY created_at DESC").all(orgId);
+});
+
+ipcMain.handle('add-investor', (event, { id, name, firm, email, status = 'New', notes = '', orgId = 'org-default' }) => {
+  try {
+    db.prepare("INSERT INTO investors (id, name, firm, email, status, notes, org_id) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, name, firm, email, status, notes, orgId);
+    broadcastStateUpdate();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('upload-investors-csv', (event, { csvData, orgId = 'org-default' }) => {
+  try {
+    const { parse } = require('csv-parse/sync');
+    const records = parse(csvData, { columns: true, skip_empty_lines: true });
+    
+    const insertInvestor = db.prepare('INSERT OR IGNORE INTO investors (id, name, firm, email, status, notes, org_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    const insertMany = db.transaction((records) => {
+      for (const row of records) {
+        const id = 'inv-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
+        // Expecting standard headers: name, firm, email, notes
+        insertInvestor.run(id, row.name || 'Unknown', row.firm || 'Unknown Firm', row.email || '', 'New', row.notes || '', orgId);
+      }
+    });
+    insertMany(records);
+    broadcastStateUpdate();
+    return { success: true, count: records.length };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('trigger-investor-outreach', async (event, orgId = 'org-default') => {
+  try {
+    const { executeManualTask } = require('./orchestrator');
+    await executeManualTask('investor-relations', 'Please check for new investors and draft an outreach email.');
+    broadcastStateUpdate();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+function broadcastStateUpdate() {
+  const windows = BrowserWindow.getAllWindows();
+  if (windows.length === 0) return;
+  const win = windows[0];
+
+  try {
+    win.webContents.send('db-changed');
+  } catch(e) {
+    console.error("Error broadcasting state update:", e);
+  }
+}
+
+module.exports.broadcastStateUpdate = broadcastStateUpdate;

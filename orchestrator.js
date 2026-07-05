@@ -6,27 +6,16 @@ const { executeAction } = require('./publisher');
 const { getModelsForAgent } = require('./model-router');
 const { injectTemplate } = require('./content-templates');
 const env = require('./utils/env');
+const { safeStorage } = require('electron');
 
 // The `env` module is already imported.
 // OPENROUTER_API_KEY is retrieved via env.get() inside callOpenRouter.
 
+const { initRAG, retrieveContext } = require('./rag-engine');
+
 let isRunning = false;
 let isTickRunning = false;
 const promptCache = new Map();
-let atmaContext = "";
-
-// ─── Load RAG Vault ─────────────────────────────────────────────────────────
-function loadRAGVault() {
-  try {
-    const vaultPath = path.join(__dirname, 'vault', 'atma_context.txt');
-    if (fs.existsSync(vaultPath)) {
-      atmaContext = fs.readFileSync(vaultPath, 'utf8');
-    }
-  } catch (e) {
-    console.warn("Could not load vault/atma_context.txt");
-  }
-}
-loadRAGVault();
 
 // ─── Phase 6: Critique Loop (Self-Reflection) ──────────────────────────────
 async function evaluateDraft(draftText) {
@@ -75,20 +64,83 @@ function sanitizeOutput(text) {
   return clean.trim();
 }
 
+// ─── Gemini Direct API Integration ──────────────────────────────────────────────
+async function callGeminiDirect(systemPrompt, userPrompt) {
+  const apiKey = env.get('GEMINI_API_KEY');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+  
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({
+      contents: [{ parts: [{ text: `${systemPrompt}\n\nTask: ${userPrompt}` }] }]
+    });
+
+    const options = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    };
+
+    const req = https.request(url, options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => body += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(body);
+          if (parsed.candidates && parsed.candidates.length > 0) {
+            resolve(parsed.candidates[0].content.parts[0].text);
+          } else {
+            resolve(null);
+          }
+        } catch (e) { reject(e); }
+      });
+    });
+
+    req.on('error', (e) => reject(e));
+    req.write(data);
+    req.end();
+  });
+}
+
+// ─── Media Generators (Kling & ElevenLabs) ──────────────────────────────────
+// Kling API Key: api-key-kling-F4l-RDHlC3hUTkdE9-jTk3B-9yCgU55KvQEQ4kPffc0
+// ElevenLabs API Key: sk_4ede182ae703ecc5f7e49f1dbb1e8ecafa93bcf4967f95c8
+
+async function generateVideo(prompt) {
+  // Placeholder for Kling API logic (usually async generation -> poll for URL)
+  return `https://kling-placeholder.com/video?prompt=${encodeURIComponent(prompt)}`;
+}
+
+async function generateAudio(text) {
+  // Placeholder for ElevenLabs TTS logic
+  return `https://elevenlabs-placeholder.com/audio?text=${encodeURIComponent(text)}`;
+}
+
 // ─── OpenRouter API Call with Multi-Model Tiering & Failover ────────────────
 async function callOpenRouter(systemPrompt, userPrompt, agentId = null, primaryModel = null) {
+  // If the agent requires ultra-fast reasoning or explicitly uses gemini-flash, route to direct API
+  if (primaryModel === 'gemini-direct') {
+    return await callGeminiDirect(systemPrompt, userPrompt);
+  }
+
   let apiKey = env.get('OPENROUTER_API_KEY');
   
   try {
     const setting = db.prepare("SELECT value FROM settings WHERE key = 'openrouter_api_key'").get();
     if (setting && setting.value) {
-      apiKey = setting.value;
+      if (safeStorage && safeStorage.isEncryptionAvailable()) {
+        try {
+          apiKey = safeStorage.decryptString(Buffer.from(setting.value, 'base64'));
+        } catch (e) {
+          apiKey = setting.value; // Fallback if already plaintext or corrupted
+        }
+      } else {
+        apiKey = setting.value;
+      }
     }
   } catch(e) {}
   
   if (!apiKey) {
-    console.warn("[OpenRouter] No API key configured. Set OPENROUTER_API_KEY in .env or settings dashboard.");
-    return null;
+    console.warn("[OpenRouter] No API key configured. Falling back to Gemini Direct API.");
+    return await callGeminiDirect(systemPrompt, userPrompt);
   }
 
   const FREE_MODELS = getModelsForAgent(agentId);
@@ -159,8 +211,8 @@ async function callOpenRouter(systemPrompt, userPrompt, agentId = null, primaryM
         } else {
           console.log(`\x1b[33m[OpenRouter Failover] Model ${model} failed (${err.message}). Trying next...\x1b[0m`);
           if (i === modelsToTry.length - 1) {
-            console.log(`\x1b[31m[OpenRouter] All models failed. Agents will try again on the next tick.\x1b[0m`);
-            return null;
+            console.log(`\x1b[31m[OpenRouter] All models failed. Falling back to Gemini Direct API.\x1b[0m`);
+            return await callGeminiDirect(systemPrompt, userPrompt);
           }
           break; // Break the while loop to try the next model
         }
@@ -170,7 +222,7 @@ async function callOpenRouter(systemPrompt, userPrompt, agentId = null, primaryM
 }
 
 // ─── Agent System Prompt Loader with RAG & Episodic Memory ────────────────────
-async function getAgentSystemPrompt(agentId) {
+async function getAgentSystemPrompt(agentId, taskPrompt = "") {
   let prompt = "";
   if (promptCache.has(agentId)) {
     prompt = promptCache.get(agentId);
@@ -186,9 +238,10 @@ async function getAgentSystemPrompt(agentId) {
     }
   }
 
-  // Inject RAG Knowledge Vault Context
-  if (atmaContext) {
-    prompt += `\n\n--- BACKGROUND CONTEXT FOR ATMA AI ---\n${atmaContext}\n--------------------------------------`;
+  // Inject Vector RAG Knowledge Vault Context
+  const contextChunks = await retrieveContext(taskPrompt, 2);
+  if (contextChunks) {
+    prompt += `\n\n--- RELEVANT BACKGROUND CONTEXT ---\n${contextChunks}\n--------------------------------------`;
   }
 
   // Inject Advanced Humanization Layer & Time Awareness
@@ -252,10 +305,12 @@ function getTaskPromptForAgent(agent) {
   
   let accountsStr = connectedAccounts.map(a => `ID: ${a.id}, Name: ${a.account_name} (${a.platform})`).join(' | ');
   
-  const toolInstructions = `If you need to perform web research before drafting, output ONLY a JSON object like this: {"search": "your search query"}. Do NOT output anything else if you are searching.
-If you want to generate an image to accompany your post, you can add "generate_image": "detailed prompt for the image" to your JSON output (if outputting JSON).`;
+  const toolInstructions = `If you need to perform web research before drafting, output ONLY a JSON object like this: {"search": "your search query"}.
+If you want to generate an image, add "generate_image": "detailed prompt".
+If you want to generate a video (via Kling API), add "generate_video": "detailed video prompt".
+If you want to generate voiceover (via ElevenLabs), add "generate_audio": "text to speak".`;
 
-  let baseInstructions = `Output ONLY the raw final content. NO titles, NO labels, NO prefixes like "Tweet:" or "Post:" or "Here is". NO word counts. NO conversational filler. Start directly with the content. ${toolInstructions}`;
+  let baseInstructions = `Output ONLY the raw final content. NO titles, NO labels, NO prefixes. NO conversational filler. Start directly with the content. ${toolInstructions}`;
 
   if (connectedAccounts.length > 0 && (agent.id === 'social-media-strategist' || agent.id === 'ceo')) {
     baseInstructions = `You have the following connected accounts available to post to: [${accountsStr}].
@@ -263,7 +318,9 @@ You MUST output ONLY a JSON object in this format:
 {
   "target_account_id": <number from the list above that best fits the tone>,
   "text": "your highly humanized post content",
-  "generate_image": "optional prompt for an image to accompany this post (or null)"
+  "generate_image": "optional prompt for an image",
+  "generate_video": "optional prompt for a video",
+  "generate_audio": "optional text for voiceover"
 }
 NO OTHER TEXT. ${toolInstructions}`;
   }
@@ -279,12 +336,29 @@ NO OTHER TEXT. ${toolInstructions}`;
     return `You are the CEO. Here are the current system metrics: ${analyticsStr}.
 If metrics are low and you want to delegate work to another agent, output ONLY a JSON object like this: {"delegate": "social-media-strategist", "task": "Write a post about AI adoption"}.
 If you want to just write a social media post yourself, output the raw text (under 50 words) sounding completely human. ${baseInstructions}`;
-  } else if (agent.id === 'seo-specialist' || agent.id === 'content-strategist') {
-    return `Generate a highly optimized technical article in MDX format for the ATMA AI blog. Start with frontmatter (--- title: "...", description: "...", date: "${new Date().toISOString().substring(0, 10)}" ---) followed by 2-3 paragraphs of expert Markdown content about AI, enterprise tech, or digital transformation. ${baseInstructions}`;
+  } else if (agent.id === 'content-strategist') {
+    return `Propose an elite tech topic comparing AI models (e.g. LLaMA vs Gemini for Enterprise RAG). Output a structured brief outlining the Title, Multi-Model Comparison Points, and Architectural Concepts. ${baseInstructions}`;
+  } else if (agent.id === 'seo-specialist') {
+    return `Generate a highly optimized, multi-model technical article in MDX format. Start with frontmatter (--- title: "...", description: "...", date: "${new Date().toISOString().substring(0, 10)}" ---). The article MUST evaluate different AI models (like Llama vs Gemini), use strict H2/H3 tags, include an Executive Summary, Key Takeaways, and end with ATMA AI's consultancy offering. No fluff. Write like a top-tier tech journalist. ${baseInstructions}`;
   } else if (agent.id === 'sales-outreach' || agent.id === 'crm-manager') {
-    return `Identify 2 real tech or AI-related companies that could be potential leads for ATMA AI's consultancy services. Output ONLY a valid JSON array of 2 objects with "name" and "website" fields. ${baseInstructions}`;
+    return `Generate a JSON array of target company URLs for our next B2B CRM outreach campaign (e.g. ["https://acme.com", "https://globex.com"]). ONLY output the raw JSON array, with no markdown formatting or additional text. ${baseInstructions}`;
+  } else if (agent.id === 'research-analyst') {
+    return `Conduct a brief competitive analysis on current multi-agent orchestration platforms vs ATMA AI. Structure your findings into actionable bullet points. ${baseInstructions}`;
   } else if (agent.id === 'social-media-strategist') {
     return `Draft a short, engaging social media post (under 50 words) about AI, enterprise technology, or ATMA AI's capabilities. Make it sound completely human — conversational, authentic, with natural emoji usage. ${baseInstructions}`;
+  } else if (agent.id === 'finance-advisor') {
+    return `Analyze the current billing and revenue metrics. Draft a brief executive summary (under 100 words) on cash flow health and MRR growth strategies. ${baseInstructions}`;
+  } else if (agent.id === 'support-responder') {
+    return `Review the latest open support tickets and draft a highly empathetic, professional response template to address common customer issues. ${baseInstructions}`;
+  } else if (agent.id === 'investor-relations') {
+    let uncontactedStr = "";
+    try {
+      const pending = db.prepare("SELECT * FROM investors WHERE status = 'New' OR status = 'Follow-up' LIMIT 1").get();
+      if (pending) uncontactedStr = `We need to email ${pending.name} from ${pending.firm} (${pending.email}). Notes: ${pending.notes}.`;
+    } catch(e) {}
+    
+    return `You are the Head of Investor Relations at ATMA-AI, an elite AI consultancy founded by IIT/JNU alumni specializing in Zero-Trust AI and Custom LLM deployments.
+${uncontactedStr ? uncontactedStr + "\nWrite a highly personalized, compelling email to this investor asking for a brief call to discuss our traction and potential funding. Output ONLY valid JSON containing 'to', 'subject', and 'body'. The body should be plain text with newlines." : "No pending investors to contact right now. Output a generic JSON with 'to': 'none', 'subject': 'none', 'body': 'none'."}`;
   } else {
     return `Draft a short, actionable recommendation or social media post related to your role (under 50 words). Make it sound completely human and professional. ${baseInstructions}`;
   }
@@ -315,6 +389,18 @@ async function publishContent(agentId, content, targetAccountId = null, imageUrl
     platform = 'crm-campaign';
     refId = await executeAction('crm-campaign', content);
     db.prepare('INSERT INTO published_items (agent_id, platform, reference_id, content) VALUES (?, ?, ?, ?)').run(agentId, platform, refId, content);
+  } else if (agentId === 'investor-relations') {
+    platform = 'email';
+    try {
+      const emailData = JSON.parse(content);
+      if (emailData.to !== 'none') {
+        refId = await executeAction('email', content);
+        db.prepare('INSERT INTO published_items (agent_id, platform, reference_id, content) VALUES (?, ?, ?, ?)').run(agentId, platform, refId, content);
+        db.prepare("UPDATE investors SET status = 'Contacted', last_contact = CURRENT_TIMESTAMP WHERE email = ?").run(emailData.to);
+      }
+    } catch(e) {
+      console.error("[Orchestrator] Investor relations failed to parse JSON or send email:", e.message);
+    }
   } else {
     platform = 'generic';
     refId = await executeAction('generic', content);
@@ -325,7 +411,7 @@ async function publishContent(agentId, content, targetAccountId = null, imageUrl
 
   // Swarm Workflow Trigger
   if (agentId === 'content-strategist' || agentId === 'seo-specialist') {
-    db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run('SYSTEM', `SWARM TRIGGER: Requesting social media promo for new article`);
+    ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get('SYSTEM')?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run('SYSTEM', `SWARM TRIGGER: Requesting social media promo for new article`, __org); })()
     const prompt = `Write a short, engaging promotional tweet (under 40 words) for our new article. Here is the article snippet: "${content.substring(0, 300)}..."`;
     executeManualTask('social-media-strategist', prompt).catch(e => console.error("Swarm trigger failed:", e));
   }
@@ -340,10 +426,10 @@ async function processScheduledPosts() {
       try {
         await publishContent(proposal.agent_id, proposal.content);
         db.prepare("UPDATE proposals SET status = 'published' WHERE id = ?").run(proposal.id);
-        db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(proposal.agent_id, `SCHEDULED TASK PUBLISHED: ${proposal.content.substring(0, 80)}...`);
+        ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(proposal.agent_id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(proposal.agent_id, `SCHEDULED TASK PUBLISHED: ${proposal.content.substring(0, 80)}...`, __org); })()
       } catch (e) {
         db.prepare("UPDATE proposals SET status = 'failed' WHERE id = ?").run(proposal.id);
-        db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(proposal.agent_id, `SCHEDULED TASK FAILED: ${e.message}`);
+        ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(proposal.agent_id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(proposal.agent_id, `SCHEDULED TASK FAILED: ${e.message}`, __org); })()
       }
     }
   } catch (e) {
@@ -359,6 +445,8 @@ const AGENT_SCHEDULES = {
   'content-strategist':      { intervalMinutes: 480, preferredHour: 14, lastRun: 0 },
   'sales-outreach':          { intervalMinutes: 360, lastRun: 0 },
   'crm-manager':             { intervalMinutes: 360, lastRun: 0 },
+  'investor-relations':      { intervalMinutes: 120, lastRun: 0 },
+  'research-analyst':        { onDemand: true },
   'qa-agent':                { onDemand: true },
   '_default':                { intervalMinutes: 180, lastRun: 0 },
 };
@@ -394,7 +482,7 @@ async function runOrchestratorTick() {
     for (const agent of agents) {
       if (shouldAgentRun(agent.id)) {
         const taskPrompt = getTaskPromptForAgent(agent);
-        const systemPrompt = await getAgentSystemPrompt(agent.id);
+        const systemPrompt = await getAgentSystemPrompt(agent.id, taskPrompt);
 
         try {
           db.prepare("UPDATE agents SET status = 'working' WHERE id = ?").run(agent.id);
@@ -408,16 +496,25 @@ async function runOrchestratorTick() {
             let targetAccountId = null;
             let imageUrl = null;
 
-            // Phase 5: Extract structured output if present (Multi-Account Routing & Images)
             if (cleanedResponse.startsWith('{') && !cleanedResponse.includes('"search"') && !cleanedResponse.includes('"delegate"')) {
               try {
                 const parsed = JSON.parse(cleanedResponse);
                 if (parsed.target_account_id) targetAccountId = parsed.target_account_id;
                 
                 if (parsed.generate_image) {
-                  db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `GENERATING TRUE IMAGE: ${parsed.generate_image.substring(0, 50)}...`);
-                  // Phase 6: Real Image Generation via Pollinations
+                  ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `GENERATING IMAGE via Pollinations: ${parsed.generate_image.substring(0, 50)}...`, __org); })()
                   imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(parsed.generate_image)}?nologo=true`; 
+                }
+
+                if (parsed.generate_video) {
+                  ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `GENERATING VIDEO via Kling: ${parsed.generate_video.substring(0, 50)}...`, __org); })()
+                  imageUrl = await generateVideo(parsed.generate_video); 
+                }
+
+                if (parsed.generate_audio) {
+                  ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `GENERATING AUDIO via ElevenLabs: ${parsed.generate_audio.substring(0, 50)}...`, __org); })()
+                  // Fallback to storing the audio URL in the image_url field for now, or append to text
+                  cleanedResponse += `\n\n[Audio generated: ${await generateAudio(parsed.generate_audio)}]`;
                 }
 
                 if (parsed.text) {
@@ -428,10 +525,10 @@ async function runOrchestratorTick() {
 
             // Phase 6: Critique Loop 
             if ((agent.id === 'social-media-strategist' || agent.id === 'ceo') && !cleanedResponse.startsWith('{') && !cleanedResponse.startsWith('[')) { // don't critique tool calls or JSON arrays
-              db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `EVALUATING DRAFT for Humanization...`);
+              ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `EVALUATING DRAFT for Humanization...`, __org); })()
               const critique = await evaluateDraft(cleanedResponse);
               if (critique.score < 8) {
-                db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `DRAFT REJECTED (Score ${critique.score}/10): ${critique.feedback}`);
+                ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `DRAFT REJECTED (Score ${critique.score}/10): ${critique.feedback}`, __org); })()
                 
                 // Re-prompt the agent
                 const retryPrompt = `Your previous draft was rejected by QA. Score: ${critique.score}/10. Feedback: ${critique.feedback}. \nREWRITE it to be more human, casual, and fix the issues mentioned. DO NOT output JSON. Just output the final post text.`;
@@ -439,10 +536,10 @@ async function runOrchestratorTick() {
                 
                 if (retryResponse) {
                   cleanedResponse = sanitizeOutput(retryResponse);
-                  db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `DRAFT REWRITTEN successfully.`);
+                  ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `DRAFT REWRITTEN successfully.`, __org); })()
                 }
               } else {
-                db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `DRAFT APPROVED (Score ${critique.score}/10).`);
+                ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `DRAFT APPROVED (Score ${critique.score}/10).`, __org); })()
               }
             }
 
@@ -451,7 +548,7 @@ async function runOrchestratorTick() {
               try {
                 const searchCmd = JSON.parse(cleanedResponse);
                 if (searchCmd.search) {
-                  db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `RESEARCHING (LIVE WEB): ${searchCmd.search}`);
+                  ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `RESEARCHING (LIVE WEB): ${searchCmd.search}`, __org); })()
                   
                   // Live Web Fetch via Wikipedia API
                   let searchResultText = "No relevant real-world data found.";
@@ -483,7 +580,7 @@ async function runOrchestratorTick() {
               try {
                 const delegateCmd = JSON.parse(cleanedResponse);
                 if (delegateCmd.delegate && delegateCmd.task) {
-                  db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `CEO DELEGATED: to ${delegateCmd.delegate} - ${delegateCmd.task}`);
+                  ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `CEO DELEGATED: to ${delegateCmd.delegate} - ${delegateCmd.task}`, __org); })()
                   // Execute manual task on behalf of CEO
                   await executeManualTask(delegateCmd.delegate, delegateCmd.task);
                   continue; // Skip normal publishing for this tick
@@ -495,9 +592,9 @@ async function runOrchestratorTick() {
 
             // Self-Correction & QA Reflection Loop
             if (agent.id !== 'ceo' && agent.id !== 'qa-agent') {
-              db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `Sending draft to QA Agent for auditing...`);
-              const qaSystemPrompt = await getAgentSystemPrompt('qa-agent');
+              ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `Sending draft to QA Agent for auditing...`, __org); })()
               const qaTaskPrompt = `Audit this draft. If it is PERFECT, output {"status": "approved"}. If it needs work, output {"status": "rejected", "feedback": "your specific feedback on how to fix it"}.\n\nDraft:\n${cleanedResponse}`;
+              const qaSystemPrompt = await getAgentSystemPrompt('qa-agent', qaTaskPrompt);
               
               const qaResponseRaw = await callOpenRouter(qaSystemPrompt, qaTaskPrompt, 'qa-agent', "google/gemini-2.5-pro:free");
               if (qaResponseRaw) {
@@ -506,15 +603,15 @@ async function runOrchestratorTick() {
                   try {
                     const qaResult = JSON.parse(qaCleaned);
                     if (qaResult.status === 'rejected' && qaResult.feedback) {
-                      db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `QA REJECTED: ${qaResult.feedback}. Rewriting...`);
+                      ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `QA REJECTED: ${qaResult.feedback}. Rewriting...`, __org); })()
                       const rewritePrompt = `${taskPrompt}\n\nYour previous draft was rejected by QA with this feedback: "${qaResult.feedback}". Rewrite your draft to fix these issues. Output ONLY the raw final content.`;
                       const rewriteResponse = await callOpenRouter(systemPrompt, rewritePrompt, agent.id, primaryModel);
                       if (rewriteResponse) {
                         cleanedResponse = sanitizeOutput(rewriteResponse);
-                        db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `QA Rewrite complete.`);
+                        ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `QA Rewrite complete.`, __org); })()
                       }
                     } else {
-                      db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run('qa-agent', `Approved draft from ${agent.id}`);
+                      ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get('qa-agent')?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run('qa-agent', `Approved draft from ${agent.id}`, __org); })()
                     }
                   } catch(e) {}
                 }
@@ -524,20 +621,20 @@ async function runOrchestratorTick() {
             if (agent.auto_execute) {
               try {
                 await publishContent(agent.id, cleanedResponse, targetAccountId, imageUrl);
-                db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `AUTO-EXECUTED & PUBLISHED: ${cleanedResponse.substring(0, 80)}...`);
+                ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `AUTO-EXECUTED & PUBLISHED: ${cleanedResponse.substring(0, 80)}...`, __org); })()
               } catch (pubErr) {
                 console.error(`[Orchestrator] Auto-publish failed for ${agent.id}:`, pubErr.message);
-                db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `AUTO-EXECUTE FAILED: ${pubErr.message}`);
-                db.prepare("INSERT INTO proposals (agent_id, content, status, target_account_id, image_url) VALUES (?, ?, 'pending_review', ?, ?)").run(agent.id, cleanedResponse, targetAccountId, imageUrl);
+                ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `AUTO-EXECUTE FAILED: ${pubErr.message}`, __org); })()
+                ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO proposals (agent_id, content, status, target_account_id, image_url, org_id) VALUES (?, ?, 'pending_review', ?, ?, ?)").run(agent.id, cleanedResponse, targetAccountId, imageUrl, __org); })()
               }
             } else {
-              db.prepare("INSERT INTO proposals (agent_id, content, status, target_account_id, image_url) VALUES (?, ?, 'pending_review', ?, ?)").run(agent.id, cleanedResponse, targetAccountId, imageUrl);
-              db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `New proposal submitted for review.`);
+              ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO proposals (agent_id, content, status, target_account_id, image_url, org_id) VALUES (?, ?, 'pending_review', ?, ?, ?)").run(agent.id, cleanedResponse, targetAccountId, imageUrl, __org); })()
+              ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `New proposal submitted for review.`, __org); })()
             }
           }
         } catch (err) {
           console.error("OpenRouter Error:", err.message);
-          db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agent.id, `ERROR: ${err.message}`);
+          ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agent.id)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agent.id, `ERROR: ${err.message}`, __org); })()
         } finally {
           db.prepare("UPDATE agents SET status = 'idle' WHERE id = ?").run(agent.id);
         }
@@ -548,6 +645,12 @@ async function runOrchestratorTick() {
   } finally {
     isTickRunning = false;
 
+    // Trigger state broadcast to UI if available
+    try {
+      const { broadcastStateUpdate } = require('./main');
+      if (broadcastStateUpdate) broadcastStateUpdate();
+    } catch(e) {}
+
     if (isRunning) {
       setTimeout(runOrchestratorTick, 60000); // Check every 60s
     }
@@ -555,6 +658,7 @@ async function runOrchestratorTick() {
 }
 
 function startOrchestrator() {
+  initRAG();
   if (isRunning) return;
   isRunning = true;
   console.log("Starting ATMA AI Orchestrator...");
@@ -567,7 +671,7 @@ function stopOrchestrator() {
 
 // ─── Manual Task Execution ────────────────────────────────────────────────────
 async function executeManualTask(agentId, taskPrompt) {
-  const systemPrompt = await getAgentSystemPrompt(agentId);
+  const systemPrompt = await getAgentSystemPrompt(agentId, taskPrompt);
   try {
     db.prepare("UPDATE agents SET status = 'working' WHERE id = ?").run(agentId);
     const wrappedTask = `The user has delegated the following task to you. Execute it completely and output ONLY the final result. DO NOT ask follow-up questions. DO NOT add conversational filler. Output ONLY the final raw payload.\n\nTask:\n${taskPrompt}`;
@@ -585,7 +689,7 @@ async function executeManualTask(agentId, taskPrompt) {
         try {
           const searchCmd = JSON.parse(cleanedResponse);
           if (searchCmd.search) {
-            db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `RESEARCHING (LIVE WEB): ${searchCmd.search}`);
+            ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `RESEARCHING (LIVE WEB): ${searchCmd.search}`, __org); })()
             
             // Live Web Fetch via Wikipedia API
             let searchResultText = "No relevant real-world data found.";
@@ -614,9 +718,9 @@ async function executeManualTask(agentId, taskPrompt) {
 
       // Self-Correction & QA Reflection Loop
       if (agentId !== 'ceo' && agentId !== 'qa-agent') {
-        db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `Sending draft to QA Agent for auditing...`);
-        const qaSystemPrompt = await getAgentSystemPrompt('qa-agent');
+        ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `Sending draft to QA Agent for auditing...`, __org); })()
         const qaTaskPrompt = `Audit this draft. If it is PERFECT, output {"status": "approved"}. If it needs work, output {"status": "rejected", "feedback": "your specific feedback on how to fix it"}.\n\nDraft:\n${cleanedResponse}`;
+        const qaSystemPrompt = await getAgentSystemPrompt('qa-agent', qaTaskPrompt);
         
         const qaResponseRaw = await callOpenRouter(qaSystemPrompt, qaTaskPrompt, 'qa-agent', "google/gemini-2.5-pro:free");
         if (qaResponseRaw) {
@@ -625,15 +729,15 @@ async function executeManualTask(agentId, taskPrompt) {
             try {
               const qaResult = JSON.parse(qaCleaned);
               if (qaResult.status === 'rejected' && qaResult.feedback) {
-                db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `QA REJECTED: ${qaResult.feedback}. Rewriting...`);
+                ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `QA REJECTED: ${qaResult.feedback}. Rewriting...`, __org); })()
                 const rewritePrompt = `${wrappedTask}\n\nYour previous draft was rejected by QA with this feedback: "${qaResult.feedback}". Rewrite your draft to fix these issues. Output ONLY the raw final content.`;
                 const rewriteResponse = await callOpenRouter(systemPrompt, rewritePrompt, agent.id, primaryModel);
                 if (rewriteResponse) {
                   cleanedResponse = sanitizeOutput(rewriteResponse);
-                  db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `QA Rewrite complete.`);
+                  ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `QA Rewrite complete.`, __org); })()
                 }
               } else {
-                db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run('qa-agent', `Approved draft from ${agentId}`);
+                ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get('qa-agent')?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run('qa-agent', `Approved draft from ${agentId}`, __org); })()
               }
             } catch(e) {}
           }
@@ -643,23 +747,27 @@ async function executeManualTask(agentId, taskPrompt) {
       if (agent && agent.auto_execute) {
         try {
           await publishContent(agentId, cleanedResponse);
-          db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `Manual task auto-executed & published.`);
+          ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `Manual task auto-executed & published.`, __org); })()
         } catch (pubErr) {
           console.error(`[Orchestrator] Manual auto-publish failed:`, pubErr.message);
-          db.prepare("INSERT INTO proposals (agent_id, content, status) VALUES (?, ?, 'pending_review')").run(agentId, cleanedResponse);
-          db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `Auto-publish failed, sent to review: ${pubErr.message}`);
+          ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO proposals (agent_id, content, status, org_id) VALUES (?, ?, 'pending_review', ?)").run(agentId, cleanedResponse, __org); })()
+          ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `Auto-publish failed, sent to review: ${pubErr.message}`, __org); })()
         }
       } else {
-        db.prepare("INSERT INTO proposals (agent_id, content, status) VALUES (?, ?, 'pending_review')").run(agentId, cleanedResponse);
-        db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `Manual task submitted for review.`);
+        ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO proposals (agent_id, content, status, org_id) VALUES (?, ?, 'pending_review', ?)").run(agentId, cleanedResponse, __org); })()
+        ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `Manual task submitted for review.`, __org); })()
       }
     }
   } catch (err) {
     console.error("OpenRouter Error:", err.message);
-    db.prepare("INSERT INTO logs (agent_id, message) VALUES (?, ?)").run(agentId, `ERROR: ${err.message}`);
+    ;(function(){ const __org = db.prepare('SELECT org_id FROM agents WHERE id = ?').get(agentId)?.org_id || 'org-default'; db.prepare("INSERT INTO logs (agent_id, message, org_id) VALUES (?, ?, ?)").run(agentId, `ERROR: ${err.message}`, __org); })()
   } finally {
     db.prepare("UPDATE agents SET status = 'idle' WHERE id = ?").run(agentId);
+    try {
+      const { broadcastStateUpdate } = require('./main');
+      if (broadcastStateUpdate) broadcastStateUpdate();
+    } catch(e) {}
   }
 }
 
-module.exports = { startOrchestrator, stopOrchestrator, executeManualTask, loadRAGVault };
+module.exports = { startOrchestrator, stopOrchestrator, executeManualTask };
